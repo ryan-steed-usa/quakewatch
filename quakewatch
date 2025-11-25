@@ -41,7 +41,7 @@ def get_earthquake(feature):
     properties = feature['properties']
 
     # time is given in milliseconds since epoch
-    utctime = datetime.datetime.utcfromtimestamp(properties['time'] / 1000)
+    utctime = datetime.datetime.fromtimestamp(properties['time'] / 1000, datetime.UTC)
     timestamp = utctime.strftime('%Y-%m-%d %H:%M:%S')
 
     # colorize magnitude
