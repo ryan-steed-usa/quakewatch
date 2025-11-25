@@ -21,6 +21,9 @@ import time
 import requests
 from tabulate import tabulate
 
+# small performance optimization
+tabulate.WIDE_CHARS_MODE = False
+
 # available API endpoints
 SITES = {
     # last hour
