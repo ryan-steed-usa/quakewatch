@@ -2,21 +2,24 @@
 
 """
 This program displays a list of recent earthquakes.
-Parses JSON API Endpoint from https://earthquake.usgs.gov once a minute
-and displays the result as color coded list in the terminal.
-Requires a terminal that supports 256 colors.
+Parses GeoJSON API Endpoint from https://earthquake.usgs.gov
+and displays the result as optional color coded list in the terminal.
+Color requires a terminal that supports 256 colors.
 
 The PAGER status colors are taken from https://earthquake.usgs.gov/data/pager/background.php
 The suggested levels of response are:
 no response needed -> green,
 local/regional     -> yellow,
-national           -> orange
+national           -> orange,
 international      -> red
 """
 
 import argparse
+import dataclasses
 import datetime
+import errno
 import os
+import sys
 import time
 import requests
 from tabulate import tabulate
@@ -24,108 +27,246 @@ from tabulate import tabulate
 # small performance optimization
 tabulate.WIDE_CHARS_MODE = False
 
-# available API endpoints
-SITES = {
-    # last hour
-    'hour45': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_hour.geojson',
-    'hour25': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_hour.geojson',
-    'hour10': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_hour.geojson',
-    'all_hour': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson',
-    # last 24 hours
-    'day45': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson',
-    'day25': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson',
-    'day10': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_day.geojson',
-    'all_day': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson'
+# constants
+VERSION = '2.0'
+DESCRIPTION = '''
+Monitor recent earthquakes reported by USGS at https://earthquake.usgs.gov.
+If no arguments are specified, the significant earthquakes for the day (--day)
+is output by default.
+
+USGS has developed PAGER: an automated system for rapidly estimating impact,
+exposure, fatalities, and losses. Color-coded alerting determines the
+suggested levels of response: no response needed (green), local/regional (yellow),
+national (orange), or international (red).
+
++-------------------------+----------------------+---------------------------+
+| Alert Level and Color   | Estimated Fatalities | Estimated Losses (USD)    |
++-------------------------+----------------------+---------------------------+
+| Red                     | 1,000+               | $1 billion+               |
+| Orange                  | 100 - 999            | $100 million - $1 billion |
+| Yellow                  | 1 - 99               | $1 million - $100 million |
+| Green                   | 0                    | < $1 million              |
++-------------------------+----------------------+---------------------------+
+'''
+QUAKECOLORS = {
+    # pager
+    'green': '\033[38;5;046m',
+    'orange': '\033[38;5;208m',
+    'red': '\033[38;5;009m',
+    'reset': '\033[0m',
+    'yellow': '\033[38;5;011m',
+    # magnitude
+    'mag8': '\033[38;5;201m',
+    'mag7': '\033[38;5;001m',
+    'mag6': '\033[38;5;196m',
+    'mag5': '\033[38;5;202m',
+    'mag4': '\033[38;5;226m',
+    'mag3': '\033[38;5;216m',
+    'mag2': '\033[38;5;033m',
+    'mag1': '\033[38;5;006m'
 }
+PAGERS = ('red', 'orange', 'yellow', 'green')
+UNITS = ('hour', 'day', 'week', 'month')
+MAGS = (45, 25, 10)
+TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+# classes
+@dataclasses.dataclass
+class QwState:
+    """use class to store global states"""
+    pageralerts: list
+    alerted: bool = False
+    enablecolor: bool = True
+    refresh: int = 60
+    timeout: int = 10
+
+# functions
+def get_color(color):
+    """conditionally returns an earthquake color"""
+    if QwState.enablecolor:
+        return QUAKECOLORS[color]
+    return ''
+
+def get_sites():
+    # available API endpoints
+    """generate site URLs"""
+    # URLs
+    url = {}
+    for unit in UNITS:
+        for mag in MAGS:
+            url[f'{unit}{mag}'] = \
+                f'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/{mag/10}_{unit}.geojson'
+        url[f'all_{unit}'] = \
+            f'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_{unit}.geojson'
+        url[f'significant_{unit}'] = \
+            f'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_{unit}.geojson'
+    return url
+
+def init_args(parser):
+    """initialize arguments"""
+    parser.add_argument('-p', '--pager', help=f'enable audible terminal bell for desired pager,\
+            valid pagers are {PAGERS}', type=str, nargs='+')
+    parser.add_argument('-f', '--follow', help='enable follow mode like tail, (default: False)',\
+            action='store_true')
+    parser.add_argument('-r', '--refresh', help=f'set the API request refresh rate in seconds,\
+            minimum 60 (default: {QwState.refresh})', type=int, nargs=1)
+    parser.add_argument('-ro', '--run-once', help='disable watch and run a single loop (default:\
+            False)', action='store_true', default=False)
+    parser.add_argument('-t', '--timeout', help=f'set the API request timeout value in seconds,\
+            minimum 10 (default: {QwState.timeout})', type=int, nargs=1)
+    parser.add_argument('--color', help='control color output (default: True)',\
+            type=bool, action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+
+    group = parser.add_mutually_exclusive_group()
+    for unit in UNITS:
+        for mag in MAGS:
+            group.add_argument(f'-{unit[0]}{mag}', f'--{unit}{mag}', help=f'show earthquakes >=\
+                    M{mag / 10:.1f} of the last {unit}', action='store_true')
+        group.add_argument(f'-{unit[0]}s', f'--{unit}', help=f'show significant earthquakes of \
+                the {unit}', action='store_true')
+        group.add_argument(f'-{unit[0]}a', f'--{unit}-all', help=f'show all earthquakes of the \
+                last {unit}', action='store_true')
+    return parser.parse_args()
 
 def get_earthquake(feature):
     """returns a list of properties for one earthquake"""
-    reset = '\033[0m'
     properties = feature['properties']
 
     # time is given in milliseconds since epoch
     utctime = datetime.datetime.fromtimestamp(properties['time'] / 1000, datetime.UTC)
-    timestamp = utctime.strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = utctime.strftime(TIME_FORMAT)
 
     # colorize magnitude
     magnitude = properties['mag']
-    magstr = '{:0.2f}'.format(magnitude)
+    magstr = f'{magnitude:0.2f}'
 
     if magnitude >= 8.5:
-        magnitude = '\033[38;5;201m' + magstr + reset
+        magnitude = f'{get_color('mag8')}{magstr}{get_color('reset')}'
     elif magnitude >= 7.5:
-        magnitude = '\033[38;5;001m' + magstr + reset
+        magnitude = f'{get_color('mag7')}{magstr}{get_color('reset')}'
     elif magnitude >= 6.5:
-        magnitude = '\033[38;5;196m' + magstr + reset
+        magnitude = f'{get_color('mag6')}{magstr}{get_color('reset')}'
     elif magnitude >= 5.5:
-        magnitude = '\033[38;5;202m' + magstr + reset
+        magnitude = f'{get_color('mag5')}{magstr}{get_color('reset')}'
     elif magnitude >= 4.5:
-        magnitude = '\033[38;5;226m' + magstr + reset
+        magnitude = f'{get_color('mag4')}{magstr}{get_color('reset')}'
     elif magnitude >= 3.5:
-        magnitude = '\033[38;5;216m' + magstr + reset
+        magnitude = f'{get_color('mag3')}{magstr}{get_color('reset')}'
     elif magnitude >= 2.5:
-        magnitude = '\033[38;5;033m' + magstr + reset
+        magnitude = f'{get_color('mag2')}{magstr}{get_color('reset')}'
     elif magnitude >= 1.5:
-        magnitude = '\033[38;5;006m' + magstr + reset
+        magnitude = f'{get_color('mag1')}{magstr}{get_color('reset')}'
     else:
         magnitude = magstr
 
     # alert property is the PAGER status
-    if properties['alert'] == 'red':
-        alert = '\033[38;5;009m' + 'RED' + reset
-    elif properties['alert'] == 'orange':
-        alert = '\033[38;5;208m' + 'ORANGE' + reset
-    elif properties['alert'] == 'yellow':
-        alert = '\033[38;5;011m' + 'YELLOW' + reset
-    elif properties['alert'] == 'green':
-        alert = '\033[38;5;046m' + 'GREEN' + reset
+    alertprop = properties['alert']
+    if isinstance(alertprop, str) and alertprop.lower() in PAGERS:
+        alert = f'{get_color(alertprop)}{alertprop.upper()}{get_color('reset')}'
+        if alertprop.lower() in QwState.pageralerts and QwState.alerted is False:
+            print('\a', end='')
+            QwState.alerted = True # page only once per refresh
     else:
         alert = '-'
 
     return [timestamp, magnitude, properties['place'], alert, properties['url']]
 
-def print_table(url):
+def print_table(url, follow):
     """prints the table of all earthquakes"""
-    req = requests.get(url)
+    req = requests.get(url, timeout=QwState.timeout)
     earthquakes = req.json()
-    os.system('clear')
-    print(earthquakes['metadata']['title'])
-    print(
-        tabulate(
-            list(map(get_earthquake, earthquakes['features'])),
-            headers=['Time (UTC)', 'Mag', 'Location', 'PAGER', 'More info'],
-            floatfmt='.1f'))
+    currenttime = datetime.datetime.now(datetime.UTC)
+    quakelist = list(map(get_earthquake, earthquakes['features']))
+    quakeheaders = ('Time (UTC)', 'Mag', 'Location', 'PAGER', 'More info')
+
+    if not follow:
+        os.system('clear')
+
+    print(f'{earthquakes['metadata']['title']}, refreshing every {QwState.refresh}s')
+    print(f'Current Time (UTC): {currenttime.strftime(TIME_FORMAT)}')
+    print(f'Events found: {len(quakelist)}')
+
+    if not follow:
+        print(tabulate(quakelist, headers=quakeheaders, floatfmt='.1f'))
+    else:
+        print(' | '.join(quakeheaders))
+        for x in quakelist:
+            print(' | '.join(x))
+
+def process_args(parser, args):
+    """process arguments"""
+    if isinstance(args.pager, list):
+        for pager in args.pager:
+            if not pager in PAGERS:
+                print(f"{parser.prog}: error: argument -p/--pager: requires input of {PAGERS} not:\
+ '{pager}'", file=sys.stderr)
+                sys.exit(1)
+        QwState.pageralerts = args.pager
+    if args.refresh:
+        if args.refresh[0] > QwState.refresh:
+            QwState.refresh = args.refresh[0]
+        elif not args.refresh[0] == QwState.refresh:
+            print(f"{parser.prog}: error: argument -r/--refresh: required minimum value\
+ '{QwState.refresh}' not: '{args.refresh[0]}'", file=sys.stderr)
+            sys.exit(1)
+    if args.timeout:
+        if args.timeout[0] > QwState.timeout:
+            QwState.timeout = args.timeout[0]
+        elif not args.timeout[0] == QwState.timeout:
+            print(f"{parser.prog}: error: argument -t/--timeout: required minimum value\
+ '{QwState.timeout}' not: '{args.timeout[0]}'", file=sys.stderr)
+            sys.exit(1)
+
+def select_site(args):
+    """parse args to select a site"""
+    urls = get_sites()
+    site = urls['significant_day']
+    for unit in UNITS:
+        for mag in MAGS:
+            if getattr(args, f'{unit}{mag}', True):
+                site = urls[f'{unit}{mag}']
+        if getattr(args, f'{unit}', True):
+            site = urls[f'significant_{unit}']
+        if getattr(args, f'{unit}_all', True):
+            site = urls[f'all_{unit}']
+    return site
 
 def main():
-    parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--hour45', help='show earthquakes >= M4.5 of the last 60 minutes', action='store_true')
-    group.add_argument('--hour25', help='show earthquakes >= M2.5 of the last 60 minutes', action='store_true')
-    group.add_argument('--hour10', help='show earthquakes >= M1.0 of the last 60 minutes', action='store_true')
-    group.add_argument('--day45', help='show earthquakes >= M4.5 of the last 24 hours', action='store_true')
-    group.add_argument('--day25', help='show earthquakes >= M2.5 of the last 24 hours', action='store_true')
-    group.add_argument('--day10', help='show earthquakes >= M1.0 of the last 24 hours', action='store_true')
-    args = parser.parse_args()
+    """main function to parse arguments and watch for earthquakes"""
+    sys.stdout.reconfigure(line_buffering=True) # enable line buffering
 
-    if args.hour45:
-        site = SITES['hour45']
-    elif args.hour25:
-        site = SITES['hour25']
-    elif args.hour10:
-        site = SITES['hour10']
-    elif args.day45:
-        site = SITES['day45']
-    elif args.day25:
-        site = SITES['day25']
-    elif args.day10:
-        site = SITES['day10']
+    parser = argparse.ArgumentParser(description=DESCRIPTION, \
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    QwState.pageralerts = []
+    args = init_args(parser)
+    site = select_site(args)
+    process_args(parser, args)
+
+    QwState.enablecolor = args.color
+
     while True:
         try:
-            print_table(site)
-            time.sleep(60)
+            print_table(site, args.follow)
+            if args.follow and not args.run_once:
+                print()
+            sys.stdout.flush() # flush for pipe compatibility
+            QwState.alerted = False
+            if args.run_once:
+                break
+            time.sleep(QwState.refresh)
         except KeyboardInterrupt:
-            print() # this puts the prompt on the next line
+            print(flush=True) # this puts the prompt on the next line
             break
+        except BrokenPipeError:
+            sys.stderr.close() # handle broken pipe gracefully
+            raise
 
-
-main()
+if __name__ == "__main__":
+    try:
+        main()
+    except IOError as e:
+        if e.errno == errno.EPIPE:
+            # ignore pipe error trace
+            pass
