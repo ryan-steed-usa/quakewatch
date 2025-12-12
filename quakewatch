@@ -16,11 +16,11 @@ international      -> red
 
 import argparse
 import dataclasses
-import datetime
 import errno
 import os
 import sys
 import time
+from datetime import datetime, timezone
 import requests
 from tabulate import tabulate
 
@@ -68,7 +68,7 @@ QUAKECOLORS = {
 PAGERS = ('red', 'orange', 'yellow', 'green')
 UNITS = ('hour', 'day', 'week', 'month')
 MAGS = (45, 25, 10)
-TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+DEFAULT_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # classes
 @dataclasses.dataclass
@@ -77,8 +77,12 @@ class QwState:
     pageralerts: list
     alerted: bool = False
     enablecolor: bool = True
+    magalert: float = 666.666
+    localtime: bool = True
     refresh: int = 60
+    runonce: bool = False
     timeout: int = 10
+    timeformat: str = DEFAULT_TIME_FORMAT
 
 # functions
 def get_color(color):
@@ -106,14 +110,20 @@ def init_args(parser):
     """initialize arguments"""
     parser.add_argument('-p', '--pager', help=f'enable audible terminal bell for desired pager,\
             valid pagers are {PAGERS}', type=str, nargs='+')
+    parser.add_argument('-m', '--magnitude', help='enable audible terminal bell for specified\
+            magnitude threshold, value >= mag will trigger the bell', type=float)
     parser.add_argument('-f', '--follow', help='enable follow mode like tail, (default: False)',\
             action='store_true')
+    parser.add_argument('-l', '--localtime', help=f'display timestamps in local timezone, (default:\
+            {QwState.localtime})', action='store_true')
     parser.add_argument('-r', '--refresh', help=f'set the API request refresh rate in seconds,\
             minimum 60 (default: {QwState.refresh})', type=int, nargs=1)
     parser.add_argument('-ro', '--run-once', help='disable watch and run a single loop (default:\
             False)', action='store_true', default=False)
     parser.add_argument('-t', '--timeout', help=f'set the API request timeout value in seconds,\
             minimum 10 (default: {QwState.timeout})', type=int, nargs=1)
+    parser.add_argument('--time-format', help=f'set an strptime compatible string to customize\
+            the time format (default: {DEFAULT_TIME_FORMAT.replace("%", "%%")})', type=str)
     parser.add_argument('--color', help='control color output (default: True)',\
             type=bool, action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
@@ -134,12 +144,18 @@ def get_earthquake(feature):
     properties = feature['properties']
 
     # time is given in milliseconds since epoch
-    utctime = datetime.datetime.fromtimestamp(properties['time'] / 1000, datetime.UTC)
-    timestamp = utctime.strftime(TIME_FORMAT)
+    utctime = datetime.fromtimestamp(properties['time'] / 1000, timezone.utc)
+    localtime = utctime.astimezone()
+    timestamp = localtime if QwState.localtime else utctime
 
     # colorize magnitude
     magnitude = properties['mag']
     magstr = f'{magnitude:0.2f}'
+
+    # send terminal bell based on magnitude
+    if magnitude >= QwState.magalert and QwState.alerted is False:
+        print('\a', end='')
+        QwState.alerted = True # page only once per refresh
 
     if magnitude >= 8.5:
         magnitude = f'{get_color('mag8')}{magstr}{get_color('reset')}'
@@ -166,25 +182,31 @@ def get_earthquake(feature):
         alert = f'{get_color(alertprop)}{alertprop.upper()}{get_color('reset')}'
         if alertprop.lower() in QwState.pageralerts and QwState.alerted is False:
             print('\a', end='')
-            QwState.alerted = True # page only once per refresh
+            QwState.alerted = True
     else:
         alert = '-'
 
-    return [timestamp, magnitude, properties['place'], alert, properties['url']]
+    return [timestamp.strftime(QwState.timeformat), magnitude, properties['place'],
+            alert, properties['url']]
 
 def print_table(url, follow):
     """prints the table of all earthquakes"""
     req = requests.get(url, timeout=QwState.timeout)
     earthquakes = req.json()
-    currenttime = datetime.datetime.now(datetime.UTC)
+    currenttime = datetime.now() if QwState.localtime else datetime.now(timezone.utc)
     quakelist = list(map(get_earthquake, earthquakes['features']))
-    quakeheaders = ('Time (UTC)', 'Mag', 'Location', 'PAGER', 'More info')
+    tz_name = time.localtime().tm_zone if QwState.localtime else str(currenttime.tzinfo)
+    quakeheaders = (f"Time ({tz_name})", 'Mag', 'Location', 'PAGER', 'More info')
 
     if not follow:
         os.system('clear')
 
-    print(f'{earthquakes['metadata']['title']}, refreshing every {QwState.refresh}s')
-    print(f'Current Time (UTC): {currenttime.strftime(TIME_FORMAT)}')
+    refreshstr = ''
+    if not QwState.runonce:
+        refreshstr = f', refreshing every {QwState.refresh}s'
+
+    print(f'{earthquakes['metadata']['title']}{refreshstr}')
+    print(f'Current Time ({tz_name}): {currenttime.strftime(QwState.timeformat)}')
     print(f'Events found: {len(quakelist)}')
 
     if not follow:
@@ -204,18 +226,29 @@ def process_args(parser, args):
                 sys.exit(1)
         QwState.pageralerts = args.pager
     if args.refresh:
+        if args.run_once:
+            print(f"{parser.prog}: error: arguments -r/--refresh and -ro/--run-once cannot be used\
+ simultaneously", file=sys.stderr)
+            sys.exit(1)
         if args.refresh[0] > QwState.refresh:
             QwState.refresh = args.refresh[0]
         elif not args.refresh[0] == QwState.refresh:
-            print(f"{parser.prog}: error: argument -r/--refresh: required minimum value\
+            print(f"{parser.prog}: error: argument -r/--refresh: requires minimum value\
  '{QwState.refresh}' not: '{args.refresh[0]}'", file=sys.stderr)
             sys.exit(1)
     if args.timeout:
         if args.timeout[0] > QwState.timeout:
             QwState.timeout = args.timeout[0]
         elif not args.timeout[0] == QwState.timeout:
-            print(f"{parser.prog}: error: argument -t/--timeout: required minimum value\
+            print(f"{parser.prog}: error: argument -t/--timeout: requires minimum value\
  '{QwState.timeout}' not: '{args.timeout[0]}'", file=sys.stderr)
+            sys.exit(1)
+    if args.time_format:
+        if validate_time_format(args.time_format):
+            QwState.timeformat = args.time_format
+        else:
+            print(f"{parser.prog}: error: argument --time-format: requires strftime format\
+ like '{DEFAULT_TIME_FORMAT}' not: '{args.time_format}'", file=sys.stderr)
             sys.exit(1)
 
 def select_site(args):
@@ -232,6 +265,15 @@ def select_site(args):
             site = urls[f'all_{unit}']
     return site
 
+def validate_time_format(timefmt):
+    """test a strptime string format"""
+    timestr = datetime.now().strftime(timefmt)
+    try:
+        datetime.strptime(timestr, timefmt)
+        return True
+    except ValueError:
+        return False
+
 def main():
     """main function to parse arguments and watch for earthquakes"""
     sys.stdout.reconfigure(line_buffering=True) # enable line buffering
@@ -245,6 +287,10 @@ def main():
     process_args(parser, args)
 
     QwState.enablecolor = args.color
+    QwState.localtime = args.localtime
+    QwState.runonce = args.run_once
+    if isinstance(args.magnitude, float):
+        QwState.magalert = args.magnitude
 
     while True:
         try:
